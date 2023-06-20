@@ -1,0 +1,31 @@
+#FROM openaiacr.azurecr.io/auo/python36cv:0.0.3-x86
+FROM --platform=$TARGETARCH python:3.7.13-slim AS main
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# 如何知道 apt-get 部分應該要裝甚麼，armv7 可以參考網站 https://www.piwheels.org/
+RUN --mount=type=cache,target=/var/cache/apt \
+    --mount=type=cache,target=/var/lib/apt \
+    apt-get update && apt-get install -y --no-install-recommends wget unzip libgl1 libglib2.0-0 libgomp1 libegl1 zlib1g-dev libjpeg-dev python3-numpy python3-pandas python3-opencv
+
+# python packages 先升級 pip 才有 --prefer-binary 可用，注意加入 pypi 的兩個 index url
+RUN pip3 install --upgrade pip
+RUN --mount=type=bind,source=/requirements.armv7.txt,target=/mnt/requirements.txt \
+    pip3 install --no-cache-dir -r /mnt/requirements.txt --prefer-binary --index-url https://pypi.org/simple/ --extra-index-url https://www.piwheels.org/simple
+ 
+
+WORKDIR /
+ENV PORT 5001
+
+RUN mkdir -p /app/static
+COPY static/* /app/static/
+
+
+WORKDIR /app
+
+COPY main.py /app/main.py
+
+COPY download_weight.sh /app/download_weight.sh
+RUN /bin/sh download_weight.sh
+
+CMD uvicorn main:app --host=0.0.0.0 --port=${PORT}

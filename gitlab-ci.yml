@@ -1,0 +1,107 @@
+# This file is a template, and might need editing before it works on your project.
+docker-build-master:
+  # Official docker image.
+  image: docker:latest
+  variables:
+    # 設定 docker 內的 azure container registry  環境，以供上傳
+    DOCKER_TLS_CERTDIR: ""
+    COMPONENT_DOCKER_TAG: "dev"    
+    COMPONENT_ACR_PATH: "openaiacr.azurecr.io"
+    COMPONENT_FOLDER: "auo-training"    
+    # [重要更動區] 更動以下的 COMPONENT_NAME 請寫上您申請的 COMPONENT NAME 與 PORT ----------
+    COMPONENT_NAME: "fastapi-sample-svc"   # 命名規則，必須全為英文字母小寫, 數字, 減號，且以-svc 結尾。 不可以輸入大寫!!!
+    COMPONENT_PORT: "5001"
+    COMPONENT_EXPORT_PORT: "5001"
+    #---------------------------------------------------------------------------    
+    COMPONENT_DOCKER_NAME: "$COMPONENT_ACR_PATH/$COMPONENT_FOLDER/$COMPONENT_NAME"
+    COMPONENT_DOCKER_FULLPATH: "$COMPONENT_DOCKER_NAME:$COMPONENT_DOCKER_TAG"
+    https_proxy: "http://proxy-sslbypass.corpnet.auo.com:3128"
+    no_proxy: ".corpnet.auo.com,localhost,127.0.0.1,docker"
+
+  stage: build
+
+  services:
+    - docker:dind
+  before_script:
+    - cat /etc/issue
+    
+    # buildx
+    - mkdir -p ~/.docker/cli-plugins
+    - wget https://itvideoaiappadls.blob.core.windows.net/build-weight/docker/buildx-v0.8.2.linux-amd64 -O  ~/.docker/cli-plugins/docker-buildx
+    - chmod +x ~/.docker/cli-plugins/docker-buildx
+
+
+  script:
+    # 了解 dokcer 內的網路設定與所有環境變數
+    - ifconfig
+    - env | sort
+    # 依據每次 commit 或者是 tag 所屬的情況制定出正確的 Docker image tag 
+    - if [ -z $CI_COMMIT_TAG ]; then export COMPONENT_DOCKER_FULLPATH=${COMPONENT_DOCKER_NAME}:${COMPONENT_DOCKER_TAG}.${CI_COMMIT_SHORT_SHA}; else export COMPONENT_DOCKER_FULLPATH=${COMPONENT_DOCKER_NAME}:${CI_COMMIT_TAG}; fi
+
+
+    # build armv7 與 arm64 務必安裝以下
+    - docker run --privileged --rm tonistiigi/binfmt --install arm64,arm
+
+    # platform armv7 主要的程式碼
+    - export COMPONENT_PLATFORM="armv7" # current platform 
+    - docker buildx build -f ./Dockerfile.armv7 --platform linux/arm/v7 -t ${COMPONENT_DOCKER_FULLPATH}-armv7
+      --label com.auo.author=$GITLAB_USER_LOGIN --label com.auo.email=$GITLAB_USER_EMAIL
+      --build-arg https_proxy=$https_proxy --build-arg http_proxy=$https_proxy .
+
+    # platform arm64 主要的程式碼
+    - export COMPONENT_PLATFORM="arm64" # current platform 
+    - docker buildx build -f ./Dockerfile --platform linux/arm64 -t ${COMPONENT_DOCKER_FULLPATH}-arm64
+      --label com.auo.author=$GITLAB_USER_LOGIN --label com.auo.email=$GITLAB_USER_EMAIL
+      --build-arg https_proxy=$https_proxy --build-arg http_proxy=$https_proxy .
+
+    # platform x86 主要的程式碼
+    - export COMPONENT_PLATFORM="x86" # current platform 
+    # 針對 git tag 的形式作版號的檢查
+    - if [ ! -z $CI_COMMIT_TAG ] && [[ ! $CI_COMMIT_TAG =~ ^[0-9]+\.[0-9]+\.[0-9]+[a-z]* ]] ; then echo "TAG do not follow rule";exit 1; fi
+    # 真正的 build x86 語法
+    - docker buildx build -f ./Dockerfile --platform linux/amd64 -t ${COMPONENT_DOCKER_FULLPATH}-x86
+      --label com.auo.author=$GITLAB_USER_LOGIN --label com.auo.email=$GITLAB_USER_EMAIL
+      --build-arg https_proxy=$https_proxy --build-arg http_proxy=$https_proxy .
+    # 確認 build image 是否有成功
+    - docker images
+    - if [ $(docker images | grep -F "$COMPONENT_DOCKER_NAME" | wc -l) != 0 ]; then echo "OK" ; else  echo "Error to build $COMPONENT_DOCKER_FULLPATH"; exit 1; fi
+    # 在此 CI runner 環境底下，嘗試 run 剛 build 好的 docker image 成為 container 
+    - docker run -d -p $COMPONENT_EXPORT_PORT:$COMPONENT_PORT --name temp_container ${COMPONENT_DOCKER_FULLPATH}-x86
+    # 略為等候，以便能取到更多的 container 的 logs message 
+    - sleep 15
+    - docker logs temp_container
+    - docker ps -a  # 列出全部的 docker container 
+    - docker ps # 列出 status running containers
+    - if [ $(docker ps | grep -F "temp_container" | wc -l) != 0 ]; then echo "OK" ; else  echo "Error to run container!";exit 1; fi
+ 
+    # 測試完畢以後，略作清理 container
+    - docker stop temp_container 
+    - docker rm temp_container
+    
+    # 若為真正的 git tag trigger ，真正的 push 上去 ( # 建構三合一版本的 manifest 以便用統一版號，服務三種不同的 platform. )
+    - if [ ! -z $CI_COMMIT_TAG ]; 
+      then 
+        docker push ${COMPONENT_DOCKER_FULLPATH}-x86;
+        echo "${COMPONENT_DOCKER_FULLPATH}-x86 complete!";
+        docker push ${COMPONENT_DOCKER_FULLPATH}-arm64;
+        echo "${COMPONENT_DOCKER_FULLPATH}-arm64 complete!";
+        docker push ${COMPONENT_DOCKER_FULLPATH}-armv7;
+        echo "${COMPONENT_DOCKER_FULLPATH}-armv7 complete!";
+
+        docker manifest rm ${COMPONENT_DOCKER_FULLPATH} || true;
+        docker manifest create ${COMPONENT_DOCKER_FULLPATH}
+          ${COMPONENT_DOCKER_FULLPATH}-x86
+          ${COMPONENT_DOCKER_FULLPATH}-armv7
+          ${COMPONENT_DOCKER_FULLPATH}-arm64 ;
+        docker manifest push ${COMPONENT_DOCKER_FULLPATH};
+      else 
+        echo "skip docker push"; 
+      fi
+
+
+    - echo "$COMPONENT_DOCKER_FULLPATH complete!" 
+
+  only:
+    # - master # 每次 master commit 都會執行
+    - tags # 每次tag 都會執行
+    - web  # Web UI trigger 執行
